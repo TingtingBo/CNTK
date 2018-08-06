@@ -1899,6 +1899,44 @@ CNTK::DataType ConvertDataTypeTensorProtoToCNTK(TensorProto_DataType newDataType
     }
 }
 
+CNTK::Variable FromFP16Stat(CNTK::Variable stat, const CNTK::DeviceDescriptor &computeDevice = DeviceDescriptor::UseDefaultDevice())
+{
+    auto value_cpu = stat.GetValue()->DeepClone(computeDevice.CPUDevice(), true);
+    auto srcData = value_cpu->DataBuffer<float16>();
+
+    auto totalSize = stat.Shape().TotalSize();
+    float *dstData = new float[totalSize];
+
+    for (size_t index = 0; index < totalSize; index++)
+    {
+        dstData[index] = (float)(srcData[index]);
+    }
+
+    std::vector<size_t> dimensions;
+    for (int index = stat.Shape().Rank() - 1; index >= 0; index--)
+    {
+        dimensions.push_back(stat.Shape()[index]);
+    }
+    NDShape reversedShape = dimensions;
+
+    NDArrayViewPtr dstFinal(new NDArrayView(CNTK::DataType::Float, reversedShape, &dstData[0],
+        totalSize * sizeof(float), computeDevice.CPUDevice()));
+
+    if (computeDevice.Type() == DeviceKind::CPU)
+    {
+        Constant constantVariable(dstFinal);
+        return constantVariable;
+    }
+    else
+    {
+        NDArrayViewPtr dstFinalGPU(new NDArrayView(CNTK::DataType::Float, StorageFormat::Dense, reversedShape, computeDevice));
+        dstFinalGPU->CopyFrom(*dstFinal);
+        Constant constantVariable(dstFinalGPU);
+        return constantVariable;
+    }
+}
+
+
 FunctionPtr ONNXToCNTKHelper::CreateFunction(const Node *node, const std::vector<Variable> &inputs, const Graph *graph)
 {
     // This method checks if the node to create is a simple vanilla batch op (such as AveragePool and MaxPool, but unlike Conv)
@@ -2129,9 +2167,9 @@ FunctionPtr ONNXToCNTKHelper::CreateFunction(const Node *node, const std::vector
         auto operandPlaceholder = PlaceholderVariable(inputs[0].Shape(), L"operand", {});
         const Variable &operand = ToBatch(operandPlaceholder);
         const Variable &scale = PlaceholderVariable(inputs[1].Shape(), inputs[1].Name(), {});
-        const Variable &bias = PlaceholderVariable(inputs[2].Shape(), inputs[2].Name(), {});;
-        const Variable &runningMean = PlaceholderVariable(inputs[3].Shape(), inputs[3].Name(), {});;
-        const Variable &runningInvStd = PlaceholderVariable(inputs[4].Shape(), inputs[4].Name(), {});;
+        const Variable &bias = PlaceholderVariable(inputs[2].Shape(), inputs[2].Name(), {});
+        const Variable &runningMean = PlaceholderVariable(inputs[3].Shape(), inputs[3].Name(), {});
+        const Variable &runningInvStd = PlaceholderVariable(inputs[4].Shape(), inputs[4].Name(), {});
         const Variable &runningCount = Constant::Scalar(0.0F);
 
         bool spatial = onnxOpName == "SpatialBN" || GetNamedAttributeAsInt64(node, "spatial", 1) != 0;
@@ -2178,13 +2216,15 @@ FunctionPtr ONNXToCNTKHelper::CreateFunction(const Node *node, const std::vector
                                                       ToFixedWStringFromMultiByte(node->Name()));
 
         FunctionPtr cntkFunctionWithStaticAxis = UnpackBatch(cntkFunctionWithBatchAxis, ToFixedWStringFromMultiByte(node->Name()));
-        vector<pair<Variable, Variable>> argsMap{
-            {operandPlaceholder, inputs[0]},
-            {scale, inputs[1]},
-            {bias, inputs[2]},
-            {runningMean, inputs[3]},
-            {runningInvStd, inputs[4]},
-        };
+
+        vector<Variable> operands{ operandPlaceholder, scale, bias, runningMean, runningInvStd };
+
+        vector<pair<Variable, Variable>> argsMap{ pair<Variable, Variable>{operands[0], inputs[0]} };
+        for (int i = 1; i < 5; ++i)
+        {
+            argsMap.push_back(pair<Variable, Variable>{ operands[i], inputs[0].GetDataType() == DataType::Float16 ? FromFP16Stat(inputs[i]) : inputs[i]});
+        }
+
         return AsBlock(std::move(cntkFunctionWithStaticAxis), argsMap,
             cntkFunctionWithBatchAxis->OpName(), ToFixedWStringFromMultiByte(node->Name()));
     }
